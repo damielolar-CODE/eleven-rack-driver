@@ -26,6 +26,7 @@ struct ControlPanel: View {
 
     @State private var contentHeight: CGFloat = 460
 
+
     /// Never let the popover be taller than the usable screen area, so its top
     /// can't run above the menu bar. It scrolls if the content is taller.
     private var maxHeight: CGFloat {
@@ -49,12 +50,15 @@ struct ControlPanel: View {
         VStack(alignment: .leading, spacing: 9) {
             header
             Divider()
-            sampleRateRow
-            Divider()
             HStack(alignment: .top, spacing: 14) {
                 meterColumn(title: "Inputs", names: ER.inputNames, levels: model.inputLevels)
                 meterColumn(title: "Outputs", names: ER.outputNames, levels: model.outputLevels)
             }
+            Divider()
+            clockSourceRow
+            sampleRateRow
+            Divider()
+            rigInputSection
             Divider()
             midiRow
             Divider()
@@ -93,8 +97,31 @@ struct ControlPanel: View {
                 }
             }
             .labelsHidden()
-            .frame(width: 110)
+            .fixedSize()                 // natural size; Spacer pushes it flush right
             .disabled(!model.deviceAvailable)
+        }
+    }
+
+    private var clockSourceRow: some View {
+        HStack {
+            Text("Clock source").font(.subheadline)
+            if model.clockSource >= 2 {          // digital source → show whether it's locked to a signal
+                Image(systemName: model.clockLocked ? "lock.fill" : "lock.open.fill")
+                    .font(.caption)
+                    .foregroundStyle(model.clockLocked ? .green : .orange)
+                    .help(model.clockLocked ? "Locked to the digital input signal"
+                                            : "No valid clock on this digital input — check the cable/source")
+            }
+            Spacer()
+            Picker("", selection: clockBinding) {
+                ForEach(ER.clockSources, id: \.value) { src in
+                    Text(src.label).tag(src.value)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+            .disabled(!model.deviceAvailable)
+            .help("Switching restarts the audio engine to re-lock the clock. Digital sources need a valid signal on that input.")
         }
     }
 
@@ -119,11 +146,28 @@ struct ControlPanel: View {
         }
     }
 
+    /// Rig Input selector: a dropdown of all nine sources. Disabled until the
+    /// Eleven Rack's MIDI port is present and it has reported its current input.
+    private var rigInputSection: some View {
+        HStack {
+            Text("Rig Input").font(.subheadline)
+            Spacer()
+            Picker("", selection: rigInputBinding) {
+                ForEach(0...RigInput.maxValue, id: \.self) { i in
+                    Text(RigInput.names[i]).tag(i)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()                 // natural size; Spacer pushes it flush right
+            .disabled(!(model.midiPresent && model.rigInput != nil))
+        }
+        .help("Choose the Eleven Rack's input source. Set it to Re-Amp to re-amp "
+            + "from a DAW: play a dry track out the Re-Amp L+R outputs and record "
+            + "the wet return on Eleven Rig L+R.")
+    }
+
     private var actions: some View {
         VStack(spacing: 8) {
-            Toggle("Launch at login", isOn: launchBinding)
-                .toggleStyle(.switch)
-                .disabled(!LaunchAgentControl.isInstalled)
             HStack {
                 Button("Audio MIDI Setup", action: onOpenAudioMIDISetup)
                 Spacer()
@@ -131,6 +175,10 @@ struct ControlPanel: View {
             }
             HStack {
                 Button("Uninstall…", role: .destructive, action: onUninstall)
+                Spacer()
+                Toggle("Launch at login", isOn: launchBinding)
+                    .toggleStyle(.switch)
+                    .disabled(!LaunchAgentControl.isInstalled)
                 Spacer()
                 Button("Quit", action: onQuit)
             }
@@ -151,10 +199,18 @@ struct ControlPanel: View {
         Binding(get: { model.sampleRate == 0 ? 48000 : model.sampleRate },
                 set: { model.setSampleRate($0) })
     }
+    private var clockBinding: Binding<Int> {
+        Binding(get: { model.clockSource }, set: { model.setClockSource($0) })
+    }
 
     private var launchBinding: Binding<Bool> {
         Binding(get: { model.launchAtLogin },
                 set: { model.toggleLaunchAtLogin($0) })
+    }
+
+    private var rigInputBinding: Binding<Int> {
+        Binding(get: { model.rigInput ?? RigInput.guitar },
+                set: { model.setRigInput($0) })
     }
 
     private func rateLabel(_ hz: UInt32) -> String {

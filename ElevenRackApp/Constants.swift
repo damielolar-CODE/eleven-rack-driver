@@ -28,4 +28,10 @@ enum ER {
 
     /// Sample rates the hardware supports.
     static let sampleRates: [UInt32] = [44100, 48000, 88200, 96000]
+
+    /// Hardware clock source — the UAC2 clock-selector value the engine asserts at startup (via ER_CLOCK).
+    /// Persisted here; the device can't change it itself, so we only ever set it. (2 = Avid "asbu"/AES.)
+    static let clockSourceKey = "ER_ClockSource"
+    static let defaultClockSource = 1
+    static let clockSources: [(value: Int, label: String)] = [(1, "Internal"), (2, "AES"), (3, "S/PDIF")]
 }

@@ -72,6 +72,10 @@ final class EngineController {
         let p = Process()
         p.executableURL = url
         p.arguments = []                     // default bridge mode
+        // Assert the persisted hardware clock source at startup (ER_CLOCK; the engine reads it once).
+        var env = ProcessInfo.processInfo.environment
+        env["ER_CLOCK"] = String(UserDefaults.standard.object(forKey: ER.clockSourceKey) as? Int ?? ER.defaultClockSource)
+        p.environment = env
         if let log = openLog() {
             p.standardOutput = log
             p.standardError = log

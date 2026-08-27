@@ -17,3 +17,6 @@ ElevenRackBridge/speedcheck
 # macOS
 .DS_Store
 ._*
+
+# Rig Input / clock diagnostic (built ad-hoc; source erctl.c is tracked)
+ElevenRackBridge/erctl

@@ -102,6 +102,8 @@ final class StatusController {
         guard let button = statusItem.button else { return }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         NSApp.activate(ignoringOtherApps: true)
+        model.panelVisible = true // start the 30 Hz meters now that the panel is shown
+        model.refreshRigInput()   // read current Rig Input once, only while the panel is open
         installClickCatcher()
         // Make the popover the key window so its controls render in the active
         // (bright) appearance rather than the dimmed inactive one. App activation
@@ -115,6 +117,7 @@ final class StatusController {
     }
 
     private func closePopover() {
+        model.panelVisible = false   // stop the 30 Hz meter churn while hidden
         popover.performClose(nil)
         clickCatcher?.orderOut(nil)
         clickCatcher = nil

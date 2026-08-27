@@ -176,6 +176,21 @@ static IOReturn setClockSource(IOUSBDeviceInterface500 **dev, uint8_t src){
     return (*dev)->DeviceRequest(dev, &req);
 }
 
+static uint8_t gClockSrc = 1;   /**< The clock source we asserted (1 Internal · 2 AES · 3 S/PDIF). */
+
+/**
+ * @brief Read a clock source's UAC2 Clock-Validity control (1 = locked to a valid signal).
+ * @param dev        Open device interface.
+ * @param srcEntity  Clock-source entity id (0x81 Internal · 0x82 AES · 0x83 S/PDIF).
+ * @return 1 if locked/valid, else 0 (also 0 on request failure).
+ */
+static uint8_t readClockValid(IOUSBDeviceInterface500 **dev, uint8_t srcEntity){
+    uint8_t v=0; IOUSBDevRequest req;
+    req.bmRequestType=0xA1; req.bRequest=0x01; req.wValue=0x0300;   // GET_CUR · CS=Clock Validity · CN=0
+    req.wIndex=((UInt16)srcEntity<<8)|1; req.wLength=1; req.pData=&v; req.wLenDone=0;
+    return ((*dev)->DeviceRequest(dev,&req)==kIOReturnSuccess) ? v : 0;
+}
+
 /**
  * @brief Set the device sample rate via a UAC2-style SET_CUR control request.
  *
@@ -604,6 +619,20 @@ static void rateFollow(CFRunLoopTimerRef t,void*i){ (void)t;(void)i;
     if(want!=gHwRate && (want==44100||want==48000||want==88200||want==96000)){
         gPendingRate=want; gRateState=1;           // reconfigure() fires when gInFlight hits 0
     }
+    // Publish the clock source + lock state for the app's indicator. Only POLL the device (a USB control
+    // read) when the source is EXTERNAL — Internal has no Clock-Validity control, so publish "locked" once
+    // and never poll. (gClockSrc is fixed for the engine's lifetime; a change restarts the engine.)
+    static int tick=0, internalPublished=0;
+    if(gClockSrc >= 2){                                  // digital → read validity ~1 Hz
+        if(++tick>=20){ tick=0;
+            er_store32(&gRing->clockSource, gClockSrc);
+            er_store32(&gRing->clockLocked, readClockValid(gDev, 0x80+gClockSrc));
+        }
+    } else if(!internalPublished){                        // internal → publish once, no polling
+        internalPublished=1;
+        er_store32(&gRing->clockSource, gClockSrc);
+        er_store32(&gRing->clockLocked, 1);
+    }
 }
 
 /** @brief SIGINT/SIGTERM handler: request a clean stop of the run loop, which
@@ -648,7 +677,7 @@ int main(int argc,char**argv){
     if(r!=kIOReturnSuccess){printf("  open failed 0x%x\n",r);return 3;} (*dev)->SetConfiguration(dev,1);
     gDev=dev;
     uint8_t clk = getenv("ER_CLOCK")?atoi(getenv("ER_CLOCK")):1;   // 1=internal
-    IOReturn cs=setClockSource(dev, clk);
+    IOReturn cs=setClockSource(dev, clk); gClockSrc=(uint8_t)clk;
     printf("  SET clock source %d (1=internal): 0x%x %s\n", clk, cs, cs==kIOReturnSuccess?"OK":"(failed)");
     // Adopt the CoreAudio device's current (persisted) rate so the hardware and
     // the UI agree at startup. Retry briefly in case coreaudiod is still loading.

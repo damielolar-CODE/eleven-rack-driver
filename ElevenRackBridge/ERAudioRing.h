@@ -37,7 +37,7 @@
 #include <sys/stat.h>
 
 #define ER_RING_MAGIC    0x36314552u        /**< Header magic ('R','E','1','6') identifying the v6 layout. */
-#define ER_RING_VERSION  6u                 /**< Shared-layout version; bump on any struct change. */
+#define ER_RING_VERSION  7u                 /**< Shared-layout version; bump on any struct change. */
 #define ER_RING_NAME     "/ElevenRackAudioRing" /**< POSIX shared-memory object name. */
 #define ER_IN_CH         8u                 /**< Capture channel count (device → Core Audio). */
 #define ER_OUT_CH        6u                 /**< Playback channel count (Core Audio → device). */
@@ -126,6 +126,10 @@ typedef struct {
     uint32_t dbgWmClientChanges;  /**< Times the client id differed from the previous call. */
     uint32_t dbgWmLastClient;     /**< Most recent client id seen. */
     /** @} */
+
+    /** Hardware clock (engine → app). Written by the engine ~1 Hz; read by the menu-bar app. */
+    uint32_t clockSource;         /**< Clock source the engine asserted: 1 Internal · 2 AES · 3 S/PDIF. */
+    uint32_t clockLocked;         /**< 1 if that source is locked/valid (Internal is always 1; digital = its UAC2 Clock-Validity bit). */
 } ERRing;
 
 /**
@@ -183,6 +187,8 @@ static inline ERRing *er_ring_create(int *created) {
         r->sampleRate  = 48000;
         r->inChannels  = ER_IN_CH;
         r->outChannels = ER_OUT_CH;
+        r->clockSource = 1;                     /* Internal until the engine publishes the real value */
+        r->clockLocked = 1;
         er_store32(&r->magic, ER_RING_MAGIC);   /* publish last */
     }
     if (created) *created = firstTime;

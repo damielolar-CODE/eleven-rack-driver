@@ -24,6 +24,9 @@ struct RingActivity {
     let xrunDelta: UInt32
     let sampleRate: UInt32
     let engineRunning: Bool
+    /// The clock source the engine asserted (1 Internal · 2 AES · 3 S/PDIF) and whether it's locked.
+    let clockSource: UInt32
+    let clockLocked: Bool
 }
 
 final class RingReader {
@@ -81,7 +84,9 @@ final class RingReader {
             consumerActive: dRd > 0,   // recording only — see RingActivity doc
             xrunDelta: dX,
             sampleRate: r.pointee.sampleRate,
-            engineRunning: running)
+            engineRunning: running,
+            clockSource: r.pointee.clockSource,
+            clockLocked: r.pointee.clockLocked != 0)
     }
 
     /// Live per-channel input levels (count == ER.inputNames.count). Zeros if
