@@ -48,8 +48,14 @@ starts automatically at every login, and inverts for light/dark menu bars):
 Click the icon for the control panel:
 
 - **Live level meters** for all 8 inputs and 6 outputs.
+- **Clock-source picker** — **Internal**, **AES**, or **S/PDIF**, to slave the
+  Eleven Rack to a digital input instead of its own clock. Digital sources show a
+  **lock indicator** (green = valid signal present, orange = none); switching
+  restarts the engine to re-lock cleanly.
 - **Sample-rate picker** (44.1 / 48 / 88.2 / 96 kHz) — retunes the hardware to
   match; there's a brief (~60 ms) gap while the streams restart.
+- **Rig Input picker** — sets the Eleven Rack's rig input (Guitar, Re-Amp, Mic,
+  Line, Digital…), including **Re-Amp**, which ordinary MIDI CC can't reach.
 - **MIDI status** — the Eleven Rack's CoreMIDI endpoints.
 - **Open Audio MIDI Setup**, **Restart Engine**, **Launch at login**, and
   **Uninstall…**.
