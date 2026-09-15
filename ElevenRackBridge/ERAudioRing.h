@@ -36,8 +36,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#define ER_RING_MAGIC    0x36314552u        /**< Header magic ('R','E','1','6') identifying the v6 layout. */
-#define ER_RING_VERSION  7u                 /**< Shared-layout version; bump on any struct change. */
+#define ER_RING_MAGIC    0x37314552u        /**< Header magic ('R','E','1','7') identifying the v8 layout. */
+#define ER_RING_VERSION  8u                 /**< Shared-layout version; bump on any struct change. */
 #define ER_RING_NAME     "/ElevenRackAudioRing" /**< POSIX shared-memory object name. */
 #define ER_IN_CH         8u                 /**< Capture channel count (device → Core Audio). */
 #define ER_OUT_CH        6u                 /**< Playback channel count (Core Audio → device). */
@@ -130,6 +130,21 @@ typedef struct {
     /** Hardware clock (engine → app). Written by the engine ~1 Hz; read by the menu-bar app. */
     uint32_t clockSource;         /**< Clock source the engine asserted: 1 Internal · 2 AES · 3 S/PDIF. */
     uint32_t clockLocked;         /**< 1 if that source is locked/valid (Internal is always 1; digital = its UAC2 Clock-Validity bit). */
+
+    /**
+     * @name Playback health (engine → app), Eleven Edit build
+     * Written by the engine once per isoc request (~2 ms). Unlike ::xrunCount
+     * (capture overruns, which are normal when nothing records), these describe
+     * the PLAYBACK path only, so the menu-bar "Dropouts" flag can be honest.
+     * @{
+     */
+    uint32_t playUnderrunFrames;  /**< Output frames faded/silenced for lack of host data (monotonic). */
+    uint32_t isocErrors;          /**< USB isochronous transfer errors survived by a schedule resync (monotonic). */
+    uint32_t playLagFrames;       /**< Current lag of the play head behind the host write head (frames). */
+    uint32_t playRatioPpm;        /**< Servo read speed, parts per million of nominal (1000000 = exactly nominal). */
+    uint32_t playReanchors;       /**< Times the play head re-anchored (start / resume after a pause). */
+    uint32_t playPrimes;          /**< Times playback (re)started from idle. */
+    /** @} */
 } ERRing;
 
 /**

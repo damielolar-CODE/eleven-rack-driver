@@ -48,6 +48,9 @@ final class DriverModel: ObservableObject {
     /// Overruns-per-poll above which, with an active consumer, we flag dropouts
     /// (~a few ms of audio in a 0.33 s window).
     private static let xrunWarnThreshold: UInt32 = 300
+    /// Playback frames faded/silenced per poll above which we flag dropouts while
+    /// playback is active (~2 ms of audio in a 0.33 s window). Eleven Edit build.
+    private static let playUnderrunWarnThreshold: UInt32 = 96
     /// Consecutive warning polls required before showing the flag, so brief
     /// transients (a DAW opening the device, a sample-rate change) don't trip it.
     private static let warnStreakToShow = 3
@@ -161,7 +164,9 @@ final class DriverModel: ObservableObject {
             status = act.enginePulling ? .active : .idleNoDevice
             // Overruns only matter while an app is actually pulling audio through
             // the device; when idle the ring saturates by design.
-            if act.consumerActive && act.xrunDelta > Self.xrunWarnThreshold {
+            let recordingTrouble = act.consumerActive && act.xrunDelta > Self.xrunWarnThreshold
+            let playbackTrouble  = act.playbackActive && act.playUnderrunDelta > Self.playUnderrunWarnThreshold
+            if recordingTrouble || playbackTrouble {
                 warnStreak += 1
             } else {
                 warnStreak = 0

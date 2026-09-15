@@ -1,5 +1,12 @@
 # Eleven Rack Driver — user-space audio driver for Apple Silicon
 
+> **Eleven Edit build.** This copy is maintained by Damilola Olalere (MrDees) as
+> part of [Eleven Edit for Mac](https://github.com/damielolar-CODE/Eleven-Edit),
+> on top of [Matt Housley's Eleven Rack Driver](https://github.com/Matt-Housley/eleven-rack-driver)
+> (MIT). Matt wrote the driver; this build adds a rate-adaptive playback path,
+> real-time scheduling and error resync to remove the clicks and dropouts
+> reported with 1.x. See `History.txt` (1.2.0) for exactly what changed.
+
 <p align="center">
   <img src="assets/Application_Icon.png" width="140" alt="Eleven Rack app icon">
 </p>

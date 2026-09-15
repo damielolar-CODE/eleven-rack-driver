@@ -54,6 +54,9 @@
 #include <dispatch/dispatch.h>
 #include <math.h>
 
+#include <mach/thread_policy.h>
+#include <mach/thread_act.h>
+#include "erplay.h"
 #define ER_VID 0x0DBA            /**< Eleven Rack USB vendor ID. */
 #define ER_PID 0xB011            /**< Eleven Rack USB product ID. */
 #define ER_IF_OUT 3              /**< USB interface number for playback (isoc OUT). */
@@ -101,20 +104,15 @@ static uint32_t gHwRate=48000;                /**< Current hardware sample rate 
 static double   gOutAccum=0.0;                /**< Output accordion accumulator (fractional frames). */
 
 /**
- * @name Time-addressed playback read head
+ * @name Playback consumer (Eleven Edit build)
  * The plugin overwrites each client's WriteMix into the ring at absolute sample
- * time. The engine reads at ::gPlayHead, kept trailing the furthest written sample
- * time (::ERRing::outWriteMax) by ~::OUT_TARGET_LAT frames of buffer; it re-anchors
- * if that lag under/overruns (start, stall, drift). @{
+ * time. ::gPlay (erplay.h) reads it back at a fractional, servo-trimmed rate so
+ * the lag behind the host's write head stays at its target without ever jumping
+ * the head while audio is flowing — see erplay.h for the why. @{
  */
-static uint64_t gPlayHead=0;                  /**< Engine playback read position (sample time). */
-static uint64_t gLastWmax=0;                  /**< outWriteMax at the previous cycle (active detection). */
-static uint64_t gPrimeStart=0;                /**< Sample time playback (re)started, while prebuffering. */
-static int      gPlayInit=0;                  /**< Play head anchored to the write head yet. */
-static int      gPriming=0;                   /**< Prebuffering: emit silence until the buffer fills. */
-#define OUT_TARGET_LAT 1024u                  /**< Target lag behind the write head (frames, ~21 ms). */
-#define OUT_MIN_LAT     128u                  /**< Re-anchor (while active) if the lag falls below this. */
-#define OUT_MAX_LAT     8192u                 /**< Re-anchor if the lag exceeds this. */
+static ERPlay gPlay;                          /**< Rate-adaptive playback consumer state. */
+static volatile uint32_t gIsocErr=0;          /**< Isoc transfer errors survived by a schedule resync. */
+static volatile int      gResync=0;           /**< Set by a completion error: re-anchor the isoc schedule before the next arm. */
 /** @} */
 
 /**
@@ -385,6 +383,45 @@ static void armIn(Req*);
 static void armOut(Req*);
 static void reconfigure(void);
 
+/** @brief True for errors that mean the device is gone or the run is being torn down. */
+static int isocFatal(IOReturn res){
+    return res==kIOReturnNoDevice || res==kIOReturnNotAttached || res==kIOReturnNotResponding ||
+           res==kIOReturnAborted  || res==kIOReturnNotOpen;
+}
+static uint32_t gResyncCount=0;               /**< Diagnostics: schedule resyncs performed. */
+/**
+ * @brief Re-anchor the isoc schedule to the bus clock (after a transient error).
+ *
+ * Requests still in flight complete on their own (some with errors, which are
+ * counted, not fatal); every request armed from here on is scheduled a few ms
+ * ahead of the current bus frame again.
+ */
+static void resyncSchedule(void){
+    UInt64 bus=0; AbsoluteTime at;
+    if((*gIn)->GetBusFrameNumber(gIn,&bus,&at)==kIOReturnSuccess){ gInFrame=gOutFrame=bus+8; }
+    gResync=0; gResyncCount++;
+}
+/**
+ * @brief Put the streaming thread on the real-time (time-constraint) scheduler.
+ *
+ * The isoc completions and re-arms run on this thread. At ordinary priority a
+ * busy Mac (a browser tab opening, Spotlight, a DAW export) can hold it off for
+ * longer than the ~60 ms of requests in flight, after which every re-arm lands
+ * in the past. This is the same policy Core Audio's own IO threads use.
+ */
+static void setRealtime(void){
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    double ticksPerMs = 1e6 * (double)tb.denom / (double)tb.numer;
+    thread_time_constraint_policy_data_t pol;
+    pol.period      = (uint32_t)(2.0 * ticksPerMs);   // one isoc request span
+    pol.computation = (uint32_t)(0.4 * ticksPerMs);
+    pol.constraint  = (uint32_t)(1.5 * ticksPerMs);
+    pol.preemptible = 1;
+    kern_return_t kr = thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY,
+                                         (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    printf("  realtime scheduling: %s\n", kr==KERN_SUCCESS ? "on (time-constraint policy)" : "unavailable (running at normal priority)");
+}
+
 /**
  * @brief Completion callback for a capture request.
  *
@@ -399,7 +436,14 @@ static void reconfigure(void);
 static void inDone(void *rc,IOReturn res,void*a0){(void)a0;Req*r=(Req*)rc;
     gInFlight--;
     if(gRateState){ if(gInFlight<=0) reconfigure(); return; }   // draining for rate change
-    if(res!=kIOReturnSuccess&&res!=kIOReturnUnderrun){gStop=1;CFRunLoopStop(CFRunLoopGetCurrent());return;}
+    if(res!=kIOReturnSuccess&&res!=kIOReturnUnderrun&&res!=kIOReturnOverrun){
+        // A transient error (a request that landed in the past after a scheduler
+        // stall, a bus hiccup) used to stop the whole engine — an audible gap plus
+        // a supervisor restart. Count it, resync the schedule, keep streaming.
+        // Only a gone/unresponsive device is fatal.
+        if(isocFatal(res)){gStop=1;CFRunLoopStop(CFRunLoopGetCurrent());return;}
+        gIsocErr++; gResync=1; if(!gStop)armIn(r); return;
+    }
     // The isoc stack writes each frame's data at a FIXED stride equal to the
     // requested per-frame size (frReqCount = gInReqLen), regardless of how many
     // bytes actually arrived. So frame f is at r->data + f*gInReqLen — NOT
@@ -426,9 +470,12 @@ static void inDone(void *rc,IOReturn res,void*a0){(void)a0;Req*r=(Req*)rc;
  * @param a0   Unused.
  */
 static void outDone(void *rc,IOReturn res,void*a0){(void)a0;Req*r=(Req*)rc;
-    (void)res;
     gInFlight--;
     if(gRateState){ if(gInFlight<=0) reconfigure(); return; }
+    if(res!=kIOReturnSuccess&&res!=kIOReturnUnderrun&&res!=kIOReturnOverrun){
+        if(isocFatal(res)){gStop=1;CFRunLoopStop(CFRunLoopGetCurrent());return;}
+        gIsocErr++; gResync=1;
+    }
     if(!gStop)armOut(r);
 }
 
@@ -446,7 +493,11 @@ static void outDone(void *rc,IOReturn res,void*a0){(void)a0;Req*r=(Req*)rc;
  * @param r  Capture request to (re)submit.
  */
 static void armIn(Req*r){ for(int f=0;f<FPR;f++){r->fr[f].frReqCount=gInReqLen;r->fr[f].frActCount=0;r->fr[f].frStatus=0;}
-    if((*gIn)->ReadIsochPipeAsync(gIn,gInPipe,r->data,gInFrame,FPR,r->fr,inDone,r)!=kIOReturnSuccess){gStop=1;CFRunLoopStop(CFRunLoopGetCurrent());return;} gInFrame+=FRAME_MS; gInFlight++; }
+    if(gResync) resyncSchedule();
+    IOReturn rr=(*gIn)->ReadIsochPipeAsync(gIn,gInPipe,r->data,gInFrame,FPR,r->fr,inDone,r);
+    if(rr==kIOReturnIsoTooOld||rr==kIOReturnIsoTooNew){ gIsocErr++; resyncSchedule();      // schedule slipped: re-anchor and retry once
+        rr=(*gIn)->ReadIsochPipeAsync(gIn,gInPipe,r->data,gInFrame,FPR,r->fr,inDone,r); }
+    if(rr!=kIOReturnSuccess){gStop=1;CFRunLoopStop(CFRunLoopGetCurrent());return;} gInFrame+=FRAME_MS; gInFlight++; }
 
 /**
  * @brief Arm a playback request: pull output frames from the ring, encode, submit.
@@ -461,47 +512,18 @@ static void armIn(Req*r){ for(int f=0;f<FPR;f++){r->fr[f].frReqCount=gInReqLen;r
  */
 static void armOut(Req*r){
     size_t off=0;
-    // Keep the play head trailing coreaudiod's furthest written sample time by
-    // ~OUT_TARGET_LAT; re-anchor if it under/overruns (start, stall, drift).
-    uint64_t wmax=0;
-    if(gRing){
-        wmax = er_load(&gRing->outWriteMax);
-        int active = (wmax != gLastWmax);      // coreaudiod wrote since the last cycle
-        // Enter (re)prebuffering on first use, or when the write head is far ahead of
-        // where we read (playback resumed after silence, or the engine fell behind),
-        // or — while actively playing — if the lag drifts out of [MIN,MAX].
-        if(!gPlayInit || gPlayHead + OUT_MAX_LAT < wmax ||
-           (active && !gPriming && gPlayHead + OUT_MIN_LAT > wmax)){
-            gPriming    = 1;
-            gPrimeStart = wmax;                // consume from here once the buffer fills
-            gPlayHead   = wmax;                // read silence meanwhile
-            gPlayInit   = 1;
-        }
-        if(gPriming){
-            if(active && wmax >= gPrimeStart + OUT_TARGET_LAT){
-                gPlayHead = gPrimeStart;       // buffer built: start consuming from the top
-                gPriming  = 0;
-            } else if(gPlayHead > wmax){
-                gPlayHead = wmax;              // still filling: hold at the frontier → silence
-            }
-        } else if(gPlayHead > wmax){
-            // Paused/stopped (write head frozen): clamp so we read silence past the
-            // write head rather than looping stale audio.
-            gPlayHead = wmax;
-        }
-        gLastWmax = wmax;
-        er_store(&gRing->outPlayHead, gPlayHead);
-    }
+    // The host's furthest written sample time, read once per request (~2 ms).
+    uint64_t wmax = gRing ? er_load(&gRing->outWriteMax) : 0;
     for(int f=0;f<FPR;f++){
         gOutAccum += gHwRate/8000.0;
         int nf=(int)gOutAccum; gOutAccum-=nf;                 // frames this microframe
         if(nf>12)nf=12;
         float buf[12*ER_OUT_CH];
-        uint32_t got = 0;
-        if(gRing){ er_out_read_at(gRing, gPlayHead, wmax, buf, (uint32_t)nf); gPlayHead += (uint32_t)nf; got=(uint32_t)nf; }
+        if(gRing) erplay_process(&gPlay, gRing, wmax, buf, (uint32_t)nf);
+        else      memset(buf,0,sizeof(float)*(size_t)nf*ER_OUT_CH);
         if (gRing && !gMeterSettle) {                   // live output meters (leaky-RMS)
             for (int c=0;c<(int)ER_OUT_CH;c++){
-                for (int fr=0; fr<(int)got; fr++){ float a=buf[fr*(int)ER_OUT_CH+c];
+                for (int fr=0; fr<nf; fr++){ float a=buf[fr*(int)ER_OUT_CH+c];
                     gOutMS[c] = gOutMS[c]*METER_RMS_A + a*a*(1.0f-METER_RMS_A); }
                 gRing->outLevel[c] = sqrtf(gOutMS[c]);
             }
@@ -509,7 +531,7 @@ static void armOut(Req*r){
         uint8_t *dst = r->data + off;
         for(int fr=0; fr<nf; fr++)
             for(int c=0;c<(int)ER_OUT_CH;c++){
-                float v = (fr<(int)got)? buf[fr*ER_OUT_CH+c] : 0.f;
+                float v = buf[fr*ER_OUT_CH+c];
                 if(v>1.f)v=1.f; else if(v<-1.f)v=-1.f;
                 int32_t s=(int32_t)(v*2147483647.0);
                 memcpy(dst+(fr*(int)ER_OUT_CH+c)*4,&s,4);
@@ -518,7 +540,21 @@ static void armOut(Req*r){
         r->fr[f].frReqCount=bytes; r->fr[f].frActCount=0; r->fr[f].frStatus=0;
         off+=bytes;
     }
-    if((*gOut)->WriteIsochPipeAsync(gOut,gOutPipe,r->data,gOutFrame,FPR,r->fr,outDone,r)!=kIOReturnSuccess){return;} gOutFrame+=FRAME_MS; gInFlight++; }
+    if(gRing){                                           // playback health for the menu-bar app
+        uint64_t head=(uint64_t)gPlay.pos;
+        er_store(&gRing->outPlayHead, head);
+        er_store32(&gRing->playUnderrunFrames,(uint32_t)gPlay.underrunFrames);
+        er_store32(&gRing->isocErrors, gIsocErr);
+        er_store32(&gRing->playLagFrames,(uint32_t)((gPlay.playing && wmax>head)? (wmax-head) : 0));
+        er_store32(&gRing->playRatioPpm,(uint32_t)((gPlay.ratio-1.0)*1e6 + 1000000.5));
+        er_store32(&gRing->playReanchors, gPlay.reanchors);
+        er_store32(&gRing->playPrimes, gPlay.primes);
+    }
+    if(gResync) resyncSchedule();
+    IOReturn rr=(*gOut)->WriteIsochPipeAsync(gOut,gOutPipe,r->data,gOutFrame,FPR,r->fr,outDone,r);
+    if(rr==kIOReturnIsoTooOld||rr==kIOReturnIsoTooNew){ gIsocErr++; resyncSchedule();
+        rr=(*gOut)->WriteIsochPipeAsync(gOut,gOutPipe,r->data,gOutFrame,FPR,r->fr,outDone,r); }
+    if(rr!=kIOReturnSuccess){return;} gOutFrame+=FRAME_MS; gInFlight++; }
 
 /* ---------------------------------------------------------------------- WAV */
 
@@ -595,7 +631,7 @@ static void startMonitor(double rate){
  */
 static void reconfigure(void){
     (*gIn)->SetAlternateInterface(gIn,0); (*gOut)->SetAlternateInterface(gOut,0);
-    setSampleRate(gDev,gPendingRate); gHwRate=gPendingRate; gOutAccum=0; gPlayInit=0;
+    setSampleRate(gDev,gPendingRate); gHwRate=gPendingRate; gOutAccum=0; erplay_reset(&gPlay);
     (*gIn)->SetAlternateInterface(gIn,ER_ALT); (*gOut)->SetAlternateInterface(gOut,ER_ALT);
     UInt16 im=0; gInPipe=findPipe(gIn,true,&im); gOutPipe=findPipe(gOut,false,NULL);
     gWordPhase=0; gCarryN=0;                        // reset capture de-interleave phase
@@ -615,6 +651,12 @@ static void reconfigure(void){
  */
 static void rateFollow(CFRunLoopTimerRef t,void*i){ (void)t;(void)i;
     if(!gRing||!gDev||gRateState) return;
+    static int diagTick=0; static uint64_t lastUnder=0; static uint32_t lastErr=0;
+    if(getenv("ER_DIAG") && ++diagTick>=200){ diagTick=0;              // every 10 s
+        printf("  [health] lag=%u fr  ratio=%+.0f ppm  underrun+%llu fr  isocErr+%u  resyncs=%u  reanchors=%u\n",
+               er_load32(&gRing->playLagFrames), (gPlay.ratio-1.0)*1e6,
+               (unsigned long long)(gPlay.underrunFrames-lastUnder), gIsocErr-lastErr, gResyncCount, gPlay.reanchors);
+        lastUnder=gPlay.underrunFrames; lastErr=gIsocErr; fflush(stdout); }
     uint32_t want=er_load32(&gRing->sampleRate);
     if(want!=gHwRate && (want==44100||want==48000||want==88200||want==96000)){
         gPendingRate=want; gRateState=1;           // reconfigure() fires when gInFlight hits 0
@@ -712,7 +754,8 @@ int main(int argc,char**argv){
                // origin differs from coreaudiod's fresh StartIO timeline (which starts
                // at 0). Without this, coreaudiod's new small sample times never exceed
                // the stale value, outWriteMax never advances, and playback is silent.
-               er_store(&gRing->outWriteMax,0); er_store(&gRing->outPlayHead,0); gPlayInit=0;
+               er_store(&gRing->outWriteMax,0); er_store(&gRing->outPlayHead,0);
+               er_store32(&gRing->playUnderrunFrames,0); er_store32(&gRing->isocErrors,0);
                printf("  ring: %s (rate %u Hz)\n",created?"created":"attached",gHwRate); }
         // MIDI needs nothing from us: the Eleven Rack's USB-MIDI interface is a
         // standard class device that macOS exposes directly ("Eleven Rack Rig" /
@@ -729,6 +772,8 @@ int main(int argc,char**argv){
     // frames don't go stale while we initialize (which stalls streaming).
     if(gMonitor){ printf("  decode: %d-word unit, lanes %d/%d\n",SF_WORDS,SF_LANE_L,SF_LANE_R); startMonitor(monRate); }
 
+    erplay_init(&gPlay, getenv("ER_OUT_LAT") ? (uint32_t)atoi(getenv("ER_OUT_LAT")) : 0);
+    setRealtime();
     UInt64 bus=0;AbsoluteTime at;(*gIn)->GetBusFrameNumber(gIn,&bus,&at); gInFrame=gOutFrame=bus+25;
     uint64_t t0=mach_absolute_time();
     resetMeters();

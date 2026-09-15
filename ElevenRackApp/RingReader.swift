@@ -22,6 +22,13 @@ struct RingActivity {
     let consumerActive: Bool
     /// Overruns since the previous poll.
     let xrunDelta: UInt32
+    /// Playback frames the engine had to fade/silence since the previous poll
+    /// (Eleven Edit build) — the honest dropout signal for playback.
+    let playUnderrunDelta: UInt32
+    /// The host wrote playback audio since the previous poll.
+    let playbackActive: Bool
+    /// USB isochronous errors survived since the previous poll.
+    let isocErrorDelta: UInt32
     let sampleRate: UInt32
     let engineRunning: Bool
     /// The clock source the engine asserted (1 Internal · 2 AES · 3 S/PDIF) and whether it's locked.
@@ -35,6 +42,8 @@ final class RingReader {
     private var lastInRead: UInt64 = 0
     private var lastOutWrite: UInt64 = 0
     private var lastXrun: UInt32 = 0
+    private var lastPlayUnderrun: UInt32 = 0
+    private var lastIsocErr: UInt32 = 0
 
     /// True while a valid ring mapping is held.
     var isAttached: Bool { ring != nil }
@@ -49,6 +58,8 @@ final class RingReader {
             lastInRead = r.pointee.inRead
             lastOutWrite = r.pointee.outWriteMax   // time-addressed playback write head
             lastXrun = r.pointee.xrunCount
+            lastPlayUnderrun = r.pointee.playUnderrunFrames
+            lastIsocErr = r.pointee.isocErrors
         }
         return ring != nil
     }
@@ -58,6 +69,7 @@ final class RingReader {
         if let r = ring { er_ring_close(r, 0) }
         ring = nil
         lastInWrite = 0; lastInRead = 0; lastOutWrite = 0; lastXrun = 0
+        lastPlayUnderrun = 0; lastIsocErr = 0
     }
 
     /// Sample the ring and return activity since the previous poll. Returns nil
@@ -73,7 +85,12 @@ final class RingReader {
         let dRd = rd &- lastInRead
         let dOW = ow &- lastOutWrite
         let dX = x &- lastXrun
+        let pu = r.pointee.playUnderrunFrames
+        let ie = r.pointee.isocErrors
+        let dPU = pu &- lastPlayUnderrun
+        let dIE = ie &- lastIsocErr
         lastInWrite = w; lastInRead = rd; lastOutWrite = ow; lastXrun = x
+        lastPlayUnderrun = pu; lastIsocErr = ie
         // Only trust capture/xrun deltas as "device streaming" when the engine says
         // it is actually running. A stale leftover ring (engine gone, engineRunning
         // == 0) can keep valid magic and a drifting garbage xrun value, which would
@@ -83,6 +100,9 @@ final class RingReader {
             enginePulling: running && (dW > 0 || dX > 0),
             consumerActive: dRd > 0,   // recording only — see RingActivity doc
             xrunDelta: dX,
+            playUnderrunDelta: dPU,
+            playbackActive: dOW > 0,
+            isocErrorDelta: dIE,
             sampleRate: r.pointee.sampleRate,
             engineRunning: running,
             clockSource: r.pointee.clockSource,

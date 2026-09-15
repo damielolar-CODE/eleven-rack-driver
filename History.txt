@@ -1,3 +1,44 @@
+1.2.0  —  2026-09-15  —  Eleven Edit build: no more clicks from clock drift
+------------------------------------------
+This build is maintained by Damilola Olalere (MrDees) for Eleven Edit for Mac,
+on top of Matt Housley's driver (MIT). Matt's code, licence and credit stay;
+what follows is what changed.
+
+Audio (engine)
+  - Rate-adaptive playback consumer (ElevenRackBridge/erplay.h). The play head
+    is fractional and a slow servo trims its speed by at most 0.4 % so the lag
+    behind coreaudiod's write head sits on a target instead of drifting. Before,
+    the plug-in's mach-time timeline and the rack's USB clock drifted apart until
+    the lag left a fixed window, and the engine jumped the head and emitted
+    ~21 ms of silence: a click plus a hole, on a period set by the clocks'
+    mismatch. Samples are 4-point Hermite interpolated so the trim is inaudible.
+  - Genuine underruns fade out over 2 ms and resume with a 4 ms fade in, never
+    a step. The head keeps moving, so no re-prime when data returns.
+  - The lag target follows the host's IO burst size, so a 2048-frame IO buffer
+    cannot underrun the ring between cycles.
+  - Real-time scheduling for the streaming thread (time-constraint policy, the
+    same class Core Audio's IO threads use). At normal priority a busy Mac could
+    hold the thread off for longer than the ~60 ms of requests in flight.
+  - USB isochronous errors no longer stop the engine. Transient errors (a
+    request that landed in the past after a stall, a bus hiccup) are counted and
+    the schedule is re-anchored to the bus clock; only a gone/unresponsive
+    device is fatal.
+  - Offline simulation harness (ElevenRackBridge/tests/erplay_sim.c): host
+    clock errors from 50 to 2000 ppm either way, IO sizes 64..2048, jitter
+    storms, and a pause/resume, checked for zero underruns, servo convergence
+    and no output steps. Run it before every release.
+
+Menu-bar app
+  - "Dropouts" now means playback dropouts: it watches the engine's playback
+    underrun counter (and capture overruns only while recording), instead of
+    the capture overruns that saturate harmlessly whenever nothing records.
+  - New ring health fields (playback lag, servo ppm, isoc errors, re-anchors)
+    for diagnostics; ER_DIAG=1 prints a health line every 10 s.
+
+Shared ring
+  - Layout v8 (magic RE17). Plug-in and engine ship together in the installer.
+
+
 Eleven Rack Driver — Version History
 ====================================
 
