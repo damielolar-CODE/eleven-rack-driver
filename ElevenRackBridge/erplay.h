@@ -45,6 +45,8 @@
 #define ERPLAY_FADE_OUT_FRAMES  96.0f    /**< Underrun fade-out length (2 ms at 48 kHz). */
 #define ERPLAY_FADE_IN_FRAMES   192.0f   /**< Resume fade-in length (4 ms at 48 kHz). */
 #define ERPLAY_REANCHOR_EXTRA   8192u    /**< Re-prime if the lag exceeds target + this (a resumed source). */
+#define ERPLAY_SEED_MAX         2048.0   /**< Largest IO burst a prime may seed the target from (coreaudiod's max IO size). */
+#define ERPLAY_STOP_UPDATES     800u     /**< No host write for this many updates (100 ms) = the source stopped; stop counting underruns. */
 
 typedef struct {
     double   pos;            /**< Fractional read position (absolute sample time). */
@@ -113,7 +115,11 @@ static inline void erplay_process(ERPlay *p, const ERRing *r, uint64_t wmax, flo
     if (wmax > p->lastWmax) {
         burst = (double)(wmax - p->lastWmax); hostWrote = 1;
         if (p->lastWmax != 0 && burst < 65536.0) {
-            if (burst > p->burstMax) p->burstMax = burst; else p->burstMax *= 0.999995;  /* ~25 s decay: forget a one-off big burst, don't drift */
+            /* Track the host's IO size: jump up immediately, relax down over ~20 s of
+               bursts (0.9995 per write at ~94 writes/s), so a large first write after
+               StartIO does not hold the latency up, while a DAW's real 2048-frame IO
+               (refreshed every cycle) keeps the cushion it needs. */
+            if (burst > p->burstMax) p->burstMax = burst; else p->burstMax *= 0.9995;
             if (p->burstMax < 64.0) p->burstMax = 64.0;
         }
         p->lastWmax = wmax; p->stallUpdates = 0;
@@ -142,15 +148,16 @@ static inline void erplay_process(ERPlay *p, const ERRing *r, uint64_t wmax, flo
                it so the lag target is right from the first prime. */
             p->priming = 1;
             p->primeStart = (burst > 0.0 && burst < 65536.0) ? wmax - (uint64_t)burst : wmax;
-            if (burst >= 64.0 && burst < 65536.0) p->burstMax = burst;   /* the real IO size, not the seed */
+            /* Seed the target from this burst, capped: coreaudiod's first write after
+               StartIO can be several cycles at once and would inflate the latency. */
+            if (burst >= 64.0 && burst < 65536.0) p->burstMax = burst > ERPLAY_SEED_MAX ? ERPLAY_SEED_MAX : burst;
         }
         if (p->priming && wmax >= p->primeStart + (uint64_t)target) {
             p->pos = (double)p->primeStart;            /* consume the fresh audio from its start */
             p->lagEma = target; p->ratio = 1.0; p->integ = 0.0;
             p->playing = 1; p->priming = 0; p->gain = 0.0f; p->primes++;
         } else {
-            erplay__fade_out(p, dst, nf);
-            p->underrunFrames += nf * (p->lastWmax != 0);   /* only count once a stream existed */
+            erplay__fade_out(p, dst, nf);   /* idle/priming: silence, not a dropout */
             return;
         }
     }
@@ -178,7 +185,9 @@ static inline void erplay_process(ERPlay *p, const ERRing *r, uint64_t wmax, flo
             /* Need samples the host has not written yet: hold + fade, keep moving. */
             if (p->gain > 0.0f) { p->gain -= 1.0f / ERPLAY_FADE_OUT_FRAMES; if (p->gain < 0.0f) p->gain = 0.0f; }
             for (uint32_t c = 0; c < ER_OUT_CH; c++) d[c] = p->last[c] * p->gain;
-            p->underrunFrames++;
+            /* A dropout is missing data while the host is still writing. Once it has
+               been silent for ~100 ms the source has stopped; that is not a dropout. */
+            if (p->stallUpdates <= ERPLAY_STOP_UPDATES) p->underrunFrames++;
         } else {
             if (p->gain < 1.0f) { p->gain += 1.0f / ERPLAY_FADE_IN_FRAMES; if (p->gain > 1.0f) p->gain = 1.0f; }
             const float *s0 = r->out + (size_t)((i1 - 1) & ER_RING_MASK) * ER_OUT_CH;

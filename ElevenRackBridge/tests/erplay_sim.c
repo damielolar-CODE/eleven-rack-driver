@@ -98,7 +98,7 @@ static int run(const Scenario *sc) {
     double stepLimit = 0.045;
     double ratioMean = ratioN ? ratioSum / ratioN : 1.0;
     int ok = (underAfterSettle == 0) && (maxStep < stepLimit) && fabs((ratioMean - 1.0) * 1e6 - sc->hostPpm) < 150.0;
-    if (sc->pauseAtSec > 0) ok = (maxStep < stepLimit) && (play.primes >= 2) && (underAfterSettle == 0) && fabs((ratioMean - 1.0) * 1e6 - sc->hostPpm) < 150.0;
+    if (sc->pauseAtSec > 0) ok = (maxStep < stepLimit) && (play.primes >= 2) && (underAfterSettle == 0) && fabs((ratioMean - 1.0) * 1e6 - sc->hostPpm) < 150.0 && play.underrunFrames < 4800 + 4096;
     printf("%-34s %s  underrun=%llu/%llu fr  ratio mean %+.0f ppm [%+.0f..%+.0f] (host %+.0f)  lag=%.0f/%.0f fr  maxStep=%.4f @%.1fs  primes=%u reanchors=%u\n",
            sc->name, ok ? "PASS" : "FAIL", (unsigned long long)underAfterSettle, (unsigned long long)framesAfterSettle,
            (ratioMean - 1.0) * 1e6, (ratioMin - 1.0) * 1e6, (ratioMax - 1.0) * 1e6, sc->hostPpm, lag, erplay_target(&play), maxStep, maxStepT, play.primes, play.reanchors);
